@@ -1,53 +1,49 @@
-name: Free VPS Session
+name: VPS via Tailscale
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
-  vps-session:
+  vps:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Install Tailscale and dependencies
+      - name: Install Tailscale
         run: |
-          sudo apt update
-          sudo apt install -y curl
           curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Start Tailscale
         run: |
           sudo tailscaled &
-          sleep 10
-          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=my-vps
+          sleep 5
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-vps
 
-      - name: Show Tailscale IP
+      - name: Setup user and SSH
         run: |
-          echo "=========================================="
-          echo "✅ VPS SUCCESSFULLY STARTED!"
-          echo "=========================================="
-          echo ""
-          echo "🔗 Connect via Tailscale:"
-          echo "ssh itz_ytansh@$(tailscale ip -4)"
-          echo ""
-          echo "📝 Password: itz_ytansh"
-          echo "=========================================="
-
-      - name: Create user with password
-        run: |
+          sudo apt update
+          sudo apt install -y openssh-server
+          sudo systemctl start ssh
+          
+          # Create user
           sudo useradd -m -s /bin/bash itz_ytansh || true
           echo "itz_ytansh:itz_ytansh" | sudo chpasswd
           sudo usermod -aG sudo itz_ytansh
           echo "itz_ytansh ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/itz_ytansh
 
-      - name: Keep VPS alive
+      - name: Show connection info
         run: |
-          echo "🟢 VPS is running..."
-          echo "Connect via: ssh itz_ytansh@$(tailscale ip -4)"
-          echo "Password: itz_ytansh"
-          sleep 21600
+          echo "=============================================="
+          echo "✅ VPS ЗАПУЩЕН И ГОТОВ К ПОДКЛЮЧЕНИЮ!"
+          echo "=============================================="
+          echo ""
+          echo "🔗 Tailscale IP: $(tailscale ip -4)"
+          echo ""
+          echo "📝 Команда для подключения:"
+          echo "ssh itz_ytansh@$(tailscale ip -4)"
+          echo ""
+          echo "🔑 Пароль: itz_ytansh"
+          echo "=============================================="
+
+      - name: Keep VPS alive
+        run: sleep 21600
