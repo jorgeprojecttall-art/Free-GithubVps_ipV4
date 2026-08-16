@@ -1,4 +1,4 @@
-name: VPS with Backup
+name: VPS with Backup -France
 
 on:
   schedule:
