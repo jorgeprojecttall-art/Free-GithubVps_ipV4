@@ -1,0 +1,141 @@
+name: VPS with Backup - single vps (7 in 1)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Just under 6 hours
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname biralo
+
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools neofetch
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          echo "✅ Tailscale installed"
+
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            sudo unzip -o ./backup/backup.zip -d /
+            echo "✅ Backup restored!"
+          else
+            echo "ℹ️ No backup found, starting fresh"
+          fi
+
+      - name: Restore Tailscale state
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+            echo "✅ Tailscale state restored"
+          else
+            echo "ℹ️ No saved Tailscale state"
+          fi
+
+      - name: Start Tailscale with validation
+        run: |
+          # Проверяем, что ключ НЕ пустой
+          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
+            echo "❌ ERROR: TAILSCALE_AUTHKEY is empty or not set!"
+            echo "Please add it in: Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          
+          echo "✅ Auth key found, starting Tailscale..."
+          
+          # Запускаем Tailscale
+          sudo tailscaled &
+          sleep 10
+          
+          # Пробуем подключиться
+          if sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo; then
+            echo "✅ Tailscale connected successfully!"
+          else
+            echo "❌ Tailscale connection failed!"
+            echo "Check your auth key at: https://login.tailscale.com/admin/authkeys"
+            exit 1
+          fi
+
+      - name: Create user itz_ytansh
+        run: |
+          if ! id -u itz_ytansh >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash itz_ytansh
+            echo "itz_ytansh:itz_ytansh" | sudo chpasswd
+            sudo usermod -aG sudo itz_ytansh
+            echo "itz_ytansh ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/itz_ytansh
+            echo "✅ User itz_ytansh created"
+          else
+            echo "ℹ️ User itz_ytansh already exists"
+          fi
+
+      - name: Show connection info
+        run: |
+          echo ""
+          echo "=============================================="
+          echo "✅ VPS IS READY!"
+          echo "=============================================="
+          echo ""
+          
+          IP=$(tailscale ip -4 2>/dev/null || echo "Not found")
+          echo "🔗 Tailscale IP: $IP"
+          echo ""
+          echo "📝 Connect using:"
+          echo "   ssh itz_ytansh@$IP"
+          echo "   or"
+          echo "   ssh itz_ytansh@biralo"
+          echo ""
+          echo "🔑 Password: itz_ytansh"
+          echo "=============================================="
+          echo ""
+          
+          if [ "$IP" = "Not found" ]; then
+            echo "⚠️ WARNING: Tailscale IP not found!"
+            echo "Check Tailscale status with: sudo tailscale status"
+          fi
+
+      - name: Keep VPS alive
+        run: |
+          echo "🟢 VPS is running for 6 hours..."
+          echo "Connect: ssh itz_ytansh@biralo"
+          echo "Password: itz_ytansh"
+          sleep 21600  # 6 hours
+
+      - name: Backup VPS data
+        run: |
+          echo "📦 Creating backup..."
+          sudo mkdir -p /opt/vps-backup/data
+          
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+            echo "✅ Tailscale state saved"
+          fi
+          
+          sudo chown -R $USER:$USER /opt/vps-backup 2>/dev/null || true
+          zip -r backup.zip /opt/vps-backup 2>/dev/null || echo "ℹ️ No data to backup"
+          echo "✅ Backup created: backup.zip"
+
+      - name: Upload VPS backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
