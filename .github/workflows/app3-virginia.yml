@@ -1,0 +1,198 @@
+name: Ephemeral VPS — app3-virginia
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_name:
+        description: 'Node Name'
+        required: false
+        default: 'vpn-testbed'
+      force_virginia:
+        description: 'Только Virginia DC (true/false)'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  vps-session:
+    name: "Runner #$${{ matrix.attempt }}"
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # Запускаем 3 параллельных инстанса для гарантированного перехвата Azure East US (Virginia)
+        attempt: [1, 2, 3]
+      fail-fast: false
+    timeout-minutes: 350 # ~5.8 часов
+
+    steps:
+      # ================================================================
+      # 0. MATRIX REGION CATCH (ФИЛЬТР ДАТА-ЦЕНТРА VIRGINIA)
+      # ================================================================
+      - name: 📍 Verify Datacenter Location (Virginia Gate)
+        id: check_region
+        run: |
+          GEO_DATA=$(curl -s --max-time 4 https://ipinfo.io/json || true)
+          REGION=$(echo "$GEO_DATA" | jq -r '.region // empty')
+          CITY=$(echo "$GEO_DATA" | jq -r '.city // empty')
+          IP=$(echo "$GEO_DATA" | jq -r '.ip // empty')
+          
+          echo "🌐 Runner Public IP: $IP"
+          echo "📍 Location: $CITY, $REGION"
+          
+          IS_VIRGINIA=false
+          if [[ "$REGION" == "Virginia" || "$CITY" == *"Dulles"* || "$CITY" == *"Ashburn"* ]]; then
+            IS_VIRGINIA=true
+          fi
+          
+          echo "is_virginia=$IS_VIRGINIA" >> $GITHUB_OUTPUT
+          
+          if [[ "${{ github.event.inputs.force_virginia }}" == "true" && "$IS_VIRGINIA" != "true" ]]; then
+            echo "⏩ [Runner #${{ matrix.attempt }}] Находится в $CITY ($REGION) — не Virginia."
+            echo "⏩ Мгновенно выходим, освобождая ресурсы для инстанса в Virginia."
+            exit 0
+          fi
+          
+          echo "🎯 [Runner #${{ matrix.attempt }}] ПОДХОДИТ! Запущен в целевом ДЦ Virginia ($CITY, $REGION)!"
+
+      - name: 📥 Checkout Repository
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        uses: actions/checkout@v4
+
+      - name: ⚙️ System Tuning (BBR + Hostname)
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          NODE_NAME="${{ github.event.inputs.node_name || 'vpn-testbed' }}"
+          # Если имя дефолтное, добавляем номер попытки для уникальности в Tailscale
+          if [[ "$NODE_NAME" == "vpn-testbed" ]]; then
+            NODE_NAME="vpn-testbed-${{ matrix.attempt }}"
+          fi
+          echo "TARGET_NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
+          sudo hostnamectl set-hostname "$NODE_NAME"
+          sudo modprobe tcp_bbr || true
+          echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: 📦 Install Tools & Dependencies
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools rsync zstd jq
+
+      # ================================================================
+      # 1. CLOUDFLARE TUNNEL (ДЛЯ АДМИНКИ И ВЕБ-ПАНЕЛИ)
+      # ================================================================
+      - name: 🌐 Install Cloudflare Tunnel
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: 🔄 Start Cloudflare Tunnel (HTTPS Port 443 -> vpn-nginx)
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          sudo nohup cloudflared tunnel --url https://localhost:443 --no-tls-verify --logfile /tmp/cf_port443.log </dev/null >/dev/null 2>&1 &
+          
+          sleep 4
+          
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cf_port443.log | head -1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "CF_URL=$TUNNEL_URL" >> $GITHUB_ENV
+              echo "$TUNNEL_URL" > /tmp/tunnel_url.txt
+              echo "✅ Cloudflare Tunnel Online: $TUNNEL_URL"
+              break
+            fi
+            sleep 1
+          done
+
+      # ================================================================
+      # 2. TAILSCALE (ДЛЯ БЫСТРОГО SSH И МЕШ-СЕТИ)
+      # ================================================================
+      - name: 🛡️ Install & Connect Tailscale
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if [ -z "$TAILSCALE_AUTHKEY" ]; then
+            echo "❌ TAILSCALE_AUTHKEY is missing!"
+            exit 1
+          fi
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled &
+          sleep 5
+          sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname="${TARGET_NODE_NAME}" --accept-routes
+
+      - name: 👤 Setup SSH User & Key
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          if ! id -u itz_ytansh >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash itz_ytansh
+            echo "itz_ytansh:itz_ytansh" | sudo chpasswd
+            sudo usermod -aG sudo itz_ytansh
+            echo "itz_ytansh ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/itz_ytansh
+            
+            sudo mkdir -p /home/itz_ytansh/.ssh
+            if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+              echo "${{ secrets.SSH_PUBLIC_KEY }}" | sudo tee /home/itz_ytansh/.ssh/authorized_keys
+            fi
+            sudo chown -R itz_ytansh:itz_ytansh /home/itz_ytansh/.ssh
+            sudo chmod 700 /home/itz_ytansh/.ssh
+            sudo chmod 600 /home/itz_ytansh/.ssh/authorized_keys 2>/dev/null || true
+          fi
+
+      # ================================================================
+      # 3. РАЗВЕРТЫВАНИЕ СТЕКА VPN SAAS (DOCKER)
+      # ================================================================
+      - name: 🚀 Deploy VPN SaaS Stack (vpn-nginx, laravel, pg18, redis, xray)
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          if sudo lsof -i :80 >/dev/null 2>&1; then
+            echo "⚠️ Port 80 is in use, cleaning up..."
+            sudo fuser -k 80/tcp || true
+            sleep 2
+          fi
+          echo "✅ Port ready. Starting deployment..."
+          ./install.sh --single --no-interaction || true
+
+      # ================================================================
+      # 4. ИТОГОВАЯ ИНФОРМАЦИЯ И ДОСТУПЫ
+      # ================================================================
+      - name: 📋 Connection Dashboard Summary
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "127.0.0.1")
+          CF_URL=$(cat /tmp/tunnel_url.txt 2>/dev/null || echo "❌ Not available")
+          
+          echo "### 🚀 Ephemeral Testbed is Ready (Virginia Core)!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Access Endpoint |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 **Admin Panel & Web UI (Cloudflare CDN)** | [$CF_URL]($CF_URL) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ **SSH (Tailscale IP)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@$TS_IP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ **SSH (MagicDNS)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@${TARGET_NODE_NAME}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔑 **SSH Password (Fallback)** | \`itz_ytansh\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏱️ **Lifetime** | ~5.5 Hours |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo ""
+          echo "=============================================="
+          echo "✅ TESTBED IS READY (VIRGINIA CORE)!"
+          echo "=============================================="
+          echo "🌐 Web & Admin Panel (Cloudflare): $CF_URL"
+          echo "🛡️ SSH (Tailscale): ssh itz_ytansh@$TS_IP"
+          echo "=============================================="
+
+      - name: ⏳ Keep Session Alive
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        run: |
+          echo ""
+          echo "🟢 Testbed running in Virginia DC for ~5.5 hours..."
+          echo "🌐 Web & Admin Panel: $(cat /tmp/tunnel_url.txt 2>/dev/null || echo 'Pending...')"
+          echo "🛡️ SSH: ssh itz_ytansh@$(tailscale ip -4 2>/dev/null || echo '127.0.0.1')"
+          echo ""
+          echo "⏹️ Press 'Cancel workflow' to stop"
+          echo ""
+          sleep 20000
