@@ -1,141 +1,138 @@
-name: VPS with Backup - app3
+name: Ephemeral VPS — app3
 
 on:
   workflow_dispatch:
+    inputs:
+      node_name:
+        description: 'Node Name'
+        required: false
+        default: 'vpn-testbed'
 
 jobs:
   vps-session:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350  # Just under 6 hours
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350 # ~5.8 часов
 
     steps:
-      - name: Checkout repo
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set hostname
-        run: sudo hostnamectl set-hostname biralo
+      - name: ⚙️ System Tuning (BBR + Hostname)
+        run: |
+          sudo hostnamectl set-hostname ${{ github.event.inputs.node_name || 'vpn-testbed' }}
+          sudo modprobe tcp_bbr || true
+          echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
 
-      - name: Download VPS backup (if any)
-        uses: actions/download-artifact@v4
-        with:
-          name: vps-backup
-          path: ./backup
-        continue-on-error: true
-
-      - name: Install prerequisites
+      - name: 📦 Install Tools & Dependencies
         run: |
           sudo apt update
-          sudo apt install -y curl unzip sudo net-tools neofetch
+          sudo apt install -y curl unzip sudo net-tools rsync zstd jq
 
-      - name: Install Tailscale
+      # ================================================================
+      # 1. CLOUDFLARE TUNNEL (ДЛЯ АДМИНКИ И ВЕБ-ПАНЕЛИ)
+      # ================================================================
+      - name: 🌐 Install Cloudflare Tunnel
         run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: 🔄 Start Cloudflare Tunnel (Port 80 -> vpn-nginx)
+        run: |
+          # Запускаем туннель на порт 80 (который будет слушать vpn-nginx)
+          nohup cloudflared tunnel --url http://localhost:80 --logfile /tmp/cf_port80.log >/dev/null 2>&1 &
+          
+          sleep 3
+          
+          # Парсим URL
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cf_port80.log | head -1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "CF_URL_PORT80=$TUNNEL_URL" >> $GITHUB_ENV
+              echo "$TUNNEL_URL" > /tmp/tunnel_url_80.txt
+              echo "✅ Cloudflare Tunnel (Port 80): $TUNNEL_URL"
+              break
+            fi
+            sleep 1
+          done
+
+      # ================================================================
+      # 2. TAILSCALE (ДЛЯ БЫСТРОГО SSH И МЕШ-СЕТИ)
+      # ================================================================
+      - name: 🛡️ Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if [ -z "$TAILSCALE_AUTHKEY" ]; then
+            echo "❌ TAILSCALE_AUTHKEY is missing!"
+            exit 1
+          fi
           curl -fsSL https://tailscale.com/install.sh | sh
-          echo "✅ Tailscale installed"
-
-      - name: Restore backup files
-        run: |
-          if [ -f ./backup/backup.zip ]; then
-            sudo unzip -o ./backup/backup.zip -d /
-            echo "✅ Backup restored!"
-          else
-            echo "ℹ️ No backup found, starting fresh"
-          fi
-
-      - name: Restore Tailscale state
-        run: |
-          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
-            sudo mkdir -p /var/lib/tailscale
-            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state
-            echo "✅ Tailscale state restored"
-          else
-            echo "ℹ️ No saved Tailscale state"
-          fi
-
-      - name: Start Tailscale with validation
-        run: |
-          # Проверяем, что ключ НЕ пустой
-          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
-            echo "❌ ERROR: TAILSCALE_AUTHKEY is empty or not set!"
-            echo "Please add it in: Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          
-          echo "✅ Auth key found, starting Tailscale..."
-          
-          # Запускаем Tailscale
           sudo tailscaled &
-          sleep 10
-          
-          # Пробуем подключиться
-          if sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo; then
-            echo "✅ Tailscale connected successfully!"
-          else
-            echo "❌ Tailscale connection failed!"
-            echo "Check your auth key at: https://login.tailscale.com/admin/authkeys"
-            exit 1
-          fi
+          sleep 5
+          sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname=${{ github.event.inputs.node_name || 'vpn-testbed' }} --accept-routes
 
-      - name: Create user itz_ytansh
+      - name: 👤 Setup SSH User & Key
         run: |
           if ! id -u itz_ytansh >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash itz_ytansh
             echo "itz_ytansh:itz_ytansh" | sudo chpasswd
             sudo usermod -aG sudo itz_ytansh
             echo "itz_ytansh ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/itz_ytansh
-            echo "✅ User itz_ytansh created"
-          else
-            echo "ℹ️ User itz_ytansh already exists"
+            
+            sudo mkdir -p /home/itz_ytansh/.ssh
+            if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+              echo "${{ secrets.SSH_PUBLIC_KEY }}" | sudo tee /home/itz_ytansh/.ssh/authorized_keys
+            fi
+            sudo chown -R itz_ytansh:itz_ytansh /home/itz_ytansh/.ssh
+            sudo chmod 700 /home/itz_ytansh/.ssh
+            sudo chmod 600 /home/itz_ytansh/.ssh/authorized_keys 2>/dev/null || true
           fi
 
-      - name: Show connection info
+      # ================================================================
+      # 3. РАЗВЕРТЫВАНИЕ СТЕКА VPN SAAS (DOCKER)
+      # ================================================================
+      - name: 🚀 Deploy VPN SaaS Stack (vpn-nginx, laravel, pg18, redis, xray)
         run: |
+          ./install.sh --single --no-interaction || true
+
+      # ================================================================
+      # 4. ИТОГОВАЯ ИНФОРМАЦИЯ И ДОСТУПЫ
+      # ================================================================
+      - name: 📋 Connection Dashboard Summary
+        run: |
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "127.0.0.1")
+          CF_URL80=$(cat /tmp/tunnel_url_80.txt 2>/dev/null || echo "❌ Not available")
+          
+          echo "### 🚀 Ephemeral Testbed is Ready!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Access Endpoint |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 **Admin Panel & Web UI (Cloudflare CDN)** | [$CF_URL80]($CF_URL80) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ **SSH (Tailscale IP)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@$TS_IP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ **SSH (MagicDNS)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@${{ github.event.inputs.node_name || 'vpn-testbed' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔑 **SSH Password (Fallback)** | \`itz_ytansh\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏱️ **Lifetime** | ~5.5 Hours |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
           echo ""
           echo "=============================================="
-          echo "✅ VPS IS READY!"
+          echo "✅ TESTBED IS READY!"
           echo "=============================================="
-          echo ""
-          
-          IP=$(tailscale ip -4 2>/dev/null || echo "Not found")
-          echo "🔗 Tailscale IP: $IP"
-          echo ""
-          echo "📝 Connect using:"
-          echo "   ssh itz_ytansh@$IP"
-          echo "   or"
-          echo "   ssh itz_ytansh@biralo"
-          echo ""
-          echo "🔑 Password: itz_ytansh"
+          echo "🌐 Web & Admin Panel (Cloudflare): $CF_URL80"
+          echo "🛡️ SSH (Tailscale): ssh itz_ytansh@$TS_IP"
           echo "=============================================="
+
+      - name: ⏳ Keep Session Alive
+        run: |
           echo ""
-          
-          if [ "$IP" = "Not found" ]; then
-            echo "⚠️ WARNING: Tailscale IP not found!"
-            echo "Check Tailscale status with: sudo tailscale status"
-          fi
-
-      - name: Keep VPS alive
-        run: |
-          echo "🟢 VPS is running for 6 hours..."
-          echo "Connect: ssh itz_ytansh@biralo"
-          echo "Password: itz_ytansh"
-          sleep 21600  # 6 hours
-
-      - name: Backup VPS data
-        run: |
-          echo "📦 Creating backup..."
-          sudo mkdir -p /opt/vps-backup/data
-          
-          if [ -f /var/lib/tailscale/tailscaled.state ]; then
-            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
-            echo "✅ Tailscale state saved"
-          fi
-          
-          sudo chown -R $USER:$USER /opt/vps-backup 2>/dev/null || true
-          zip -r backup.zip /opt/vps-backup 2>/dev/null || echo "ℹ️ No data to backup"
-          echo "✅ Backup created: backup.zip"
-
-      - name: Upload VPS backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: vps-backup
-          path: backup.zip
+          echo "🟢 Testbed running for ~5.5 hours..."
+          echo "🌐 Web & Admin Panel: $(cat /tmp/tunnel_url_80.txt 2>/dev/null || echo 'Pending...')"
+          echo "🛡️ SSH: ssh itz_ytansh@$(tailscale ip -4 2>/dev/null || echo '127.0.0.1')"
+          echo ""
+          echo "⏹️ Press 'Cancel workflow' to stop"
+          echo ""
+          sleep 20000
