@@ -1,4 +1,4 @@
-name: Ephemeral VPS — VPN SaaS Testbed
+name: Ephemeral VPS — postgres1-virginia.yml
 
 on:
   workflow_dispatch:
