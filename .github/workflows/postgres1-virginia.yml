@@ -1,4 +1,4 @@
-name: Ephemeral VPS — postgres1-virginia.yml
+name: Ephemeral VPS — postgres1-virginia
 
 on:
   workflow_dispatch:
