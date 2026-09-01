@@ -1,4 +1,4 @@
-name: Ephemeral VPS — postgres2-virginia
+name: Ephemeral VPS — app1-virginia
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       node_name:
         description: 'Node Name'
         required: false
-        default: 'postgres2-virginia'
+        default: 'app1-virginia'
       force_virginia:
         description: 'Только Virginia DC (true/false)'
         type: boolean
@@ -96,7 +96,7 @@ jobs:
       - name: ⚙️ System Tuning (BBR + Hostname)
         if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
-          NODE_NAME="${{ github.event.inputs.node_name || 'postgres2-virginia' }}"
+          NODE_NAME="${{ github.event.inputs.node_name || 'app1-virginia' }}"
           echo "TARGET_NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
           sudo hostnamectl set-hostname "$NODE_NAME"
           sudo modprobe tcp_bbr || true
