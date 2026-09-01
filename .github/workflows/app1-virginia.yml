@@ -1,4 +1,4 @@
-name: Ephemeral VPS — app1-virginia
+name: Ephemeral VPS — postgres2-virginia
 
 on:
   workflow_dispatch:
@@ -6,16 +6,20 @@ on:
       node_name:
         description: 'Node Name'
         required: false
-        default: 'vpn-testbed'
+        default: 'postgres2-virginia'
       force_virginia:
         description: 'Только Virginia DC (true/false)'
         type: boolean
         required: false
         default: true
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   vps-session:
-    name: "Runner #$${{ matrix.attempt }}"
+    name: "Runner #${{ matrix.attempt }}"
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -40,7 +44,7 @@ jobs:
           echo "📍 Location: $CITY, $REGION"
           
           IS_VIRGINIA=false
-          if [[ "$REGION" == "Virginia" || "$CITY" == *"Dulles"* || "$CITY" == *"Ashburn"* ]]; then
+          if [[ "$REGION" == "Virginia" || "$CITY" == *"Dulles"* || "$CITY" == *"Ashburn"* || "$REGION" == "VA" ]]; then
             IS_VIRGINIA=true
           fi
           
@@ -57,15 +61,42 @@ jobs:
       - name: 📥 Checkout Repository
         if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ================================================================
+      # 0.1 ATOMIC LEADER ELECTION (ТОЛЬКО ОДИН RUNNER В VIRGINIA)
+      # ================================================================
+      - name: 🔒 Single Runner Lock (Atomic Leader Election)
+        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        id: claim_lock
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LOCK_TAG="lock-virginia-${{ github.run_id }}"
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          
+          # Пытаемся атомарно захватить лидерский лок через Git Tag
+          git tag "$LOCK_TAG" 2>/dev/null || true
+          if git push origin "$LOCK_TAG" 2>/dev/null; then
+            echo "👑 [Runner #${{ matrix.attempt }}] ЛОК УСПЕШНО ЗАХВАЧЕН! Этот инстанс избран как единственный активный runner."
+            echo "is_leader=true" >> $GITHUB_OUTPUT
+            echo "IS_LEADER=true" >> $GITHUB_ENV
+          else
+            echo "⏩ [Runner #${{ matrix.attempt }}] Другой runner в Virginia уже захватил лок для Run #${{ github.run_id }}."
+            echo "⏩ Мгновенно выходим, чтобы не дублировать стек и не тратить минуты."
+            echo "is_leader=false" >> $GITHUB_OUTPUT
+            echo "IS_LEADER=false" >> $GITHUB_ENV
+            exit 0
+          fi
 
       - name: ⚙️ System Tuning (BBR + Hostname)
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
-          NODE_NAME="${{ github.event.inputs.node_name || 'vpn-testbed' }}"
-          # Если имя дефолтное, добавляем номер попытки для уникальности в Tailscale
-          if [[ "$NODE_NAME" == "vpn-testbed" ]]; then
-            NODE_NAME="vpn-testbed-${{ matrix.attempt }}"
-          fi
+          NODE_NAME="${{ github.event.inputs.node_name || 'postgres2-virginia' }}"
           echo "TARGET_NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
           sudo hostnamectl set-hostname "$NODE_NAME"
           sudo modprobe tcp_bbr || true
@@ -74,7 +105,7 @@ jobs:
           sudo sysctl -p
 
       - name: 📦 Install Tools & Dependencies
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           sudo apt update
           sudo apt install -y curl unzip sudo net-tools rsync zstd jq
@@ -83,7 +114,7 @@ jobs:
       # 1. CLOUDFLARE TUNNEL (ДЛЯ АДМИНКИ И ВЕБ-ПАНЕЛИ)
       # ================================================================
       - name: 🌐 Install Cloudflare Tunnel
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
@@ -91,7 +122,7 @@ jobs:
           cloudflared --version
 
       - name: 🔄 Start Cloudflare Tunnel (HTTPS Port 443 -> vpn-nginx)
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           sudo nohup cloudflared tunnel --url https://localhost:443 --no-tls-verify --logfile /tmp/cf_port443.log </dev/null >/dev/null 2>&1 &
           
@@ -112,7 +143,7 @@ jobs:
       # 2. TAILSCALE (ДЛЯ БЫСТРОГО SSH И МЕШ-СЕТИ)
       # ================================================================
       - name: 🛡️ Install & Connect Tailscale
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -126,7 +157,7 @@ jobs:
           sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname="${TARGET_NODE_NAME}" --accept-routes
 
       - name: 👤 Setup SSH User & Key
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           if ! id -u itz_ytansh >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash itz_ytansh
@@ -147,7 +178,7 @@ jobs:
       # 3. РАЗВЕРТЫВАНИЕ СТЕКА VPN SAAS (DOCKER)
       # ================================================================
       - name: 🚀 Deploy VPN SaaS Stack (vpn-nginx, laravel, pg18, redis, xray)
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           if sudo lsof -i :80 >/dev/null 2>&1; then
             echo "⚠️ Port 80 is in use, cleaning up..."
@@ -161,7 +192,7 @@ jobs:
       # 4. ИТОГОВАЯ ИНФОРМАЦИЯ И ДОСТУПЫ
       # ================================================================
       - name: 📋 Connection Dashboard Summary
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           TS_IP=$(tailscale ip -4 2>/dev/null || echo "127.0.0.1")
           CF_URL=$(cat /tmp/tunnel_url.txt 2>/dev/null || echo "❌ Not available")
@@ -186,7 +217,7 @@ jobs:
           echo "=============================================="
 
       - name: ⏳ Keep Session Alive
-        if: steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false'
+        if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           echo ""
           echo "🟢 Testbed running in Virginia DC for ~5.5 hours..."
@@ -196,3 +227,14 @@ jobs:
           echo "⏹️ Press 'Cancel workflow' to stop"
           echo ""
           sleep 20000
+
+      # ================================================================
+      # 5. ОЧИСТКА ЛОКА (ПРИ ЗАВЕРШЕНИИ ИЛИ ОТМЕНЕ)
+      # ================================================================
+      - name: 🧹 Release Leader Lock
+        if: always() && steps.claim_lock.outputs.is_leader == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push origin --delete "lock-virginia-${{ github.run_id }}" 2>/dev/null || true
+          echo "🧹 Lock released for Run #${{ github.run_id }}"
