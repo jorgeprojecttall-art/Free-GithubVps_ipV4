@@ -1,4 +1,4 @@
-name: Ephemeral VPS — monitoring
+name: Ephemeral VPS — monitoring-virginia
 
 on:
   workflow_dispatch:
