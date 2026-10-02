@@ -165,7 +165,14 @@ jobs:
       - name: 👤 Setup SSH User & Key
         if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
+          # SSH-сервер: на Azure-машинах его нет по умолчанию
+          sudo apt-get install -y -qq openssh-server
+          # Разрешаем вход по паролю: cloudimg-конфиг имеет приоритет над sshd_config,
+          # поэтому кладём свой drop-in с меньшим номером (читается первым)
+          echo "PasswordAuthentication yes" | sudo tee /etc/ssh/sshd_config.d/10-ephemeral-password.conf > /dev/null
+          sudo systemctl enable --now ssh
           if ! id -u itz_ytansh >/dev/null 2>&1; then
+
             sudo useradd -m -s /bin/bash itz_ytansh
             echo "itz_ytansh:itz_ytansh" | sudo chpasswd
             sudo usermod -aG sudo itz_ytansh
