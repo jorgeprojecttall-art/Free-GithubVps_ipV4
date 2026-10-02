@@ -108,7 +108,7 @@ jobs:
         if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         run: |
           sudo apt update
-          sudo apt install -y curl unzip sudo net-tools rsync zstd jq
+          sudo apt install -y curl unzip net-tools rsync zstd jq
 
       # ================================================================
       # 1. CLOUDFLARE TUNNEL (ДЛЯ ДОСТУПА К МАШИНЕ)
@@ -140,21 +140,27 @@ jobs:
           done
 
       # ================================================================
-      # 2. TAILSCALE (ДЛЯ БЫСТРОГО SSH И МЕШ-СЕТИ)
+      # 2. HEADSCALE (СВОЙ CONTROL PLANE, БЕЗ TAILSCALE INC)
       # ================================================================
-      - name: 🛡️ Install & Connect Tailscale
+      - name: 🛡️ Install & Connect Headscale
         if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          HEADSCALE_AUTHKEY: ${{ secrets.HEADSCALE_AUTHKEY }}
+          HEADSCALE_CA_CRT: ${{ secrets.HEADSCALE_CA_CRT }}
+          HEADSCALE_LOGIN_SERVER: ${{ secrets.HEADSCALE_LOGIN_SERVER }}
         run: |
-          if [ -z "$TAILSCALE_AUTHKEY" ]; then
-            echo "❌ TAILSCALE_AUTHKEY is missing!"
+          if [ -z "$HEADSCALE_AUTHKEY" ] || [ -z "$HEADSCALE_CA_CRT" ] || [ -z "$HEADSCALE_LOGIN_SERVER" ]; then
+            echo "❌ HEADSCALE_AUTHKEY / HEADSCALE_CA_CRT / HEADSCALE_LOGIN_SERVER is missing!"
             exit 1
           fi
+          # CA нашего headscale-сервера — СТРОГО ДО установки tailscale:
+          # tailscaled кэширует системные сертификаты при старте и позже их не перечитывает
+          echo "$HEADSCALE_CA_CRT" | sudo tee /usr/local/share/ca-certificates/headscale-ca.crt > /dev/null
+          sudo update-ca-certificates
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscaled &
           sleep 5
-          sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname="${TARGET_NODE_NAME}" --accept-routes
+          sudo tailscale up --authkey=${HEADSCALE_AUTHKEY} --login-server=${HEADSCALE_LOGIN_SERVER} --hostname="${TARGET_NODE_NAME}" --accept-routes
 
       - name: 👤 Setup SSH User & Key
         if: (steps.check_region.outputs.is_virginia == 'true' || github.event.inputs.force_virginia == 'false') && steps.claim_lock.outputs.is_leader == 'true'
@@ -188,7 +194,7 @@ jobs:
           echo "| Service | Access Endpoint |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| 🌐 **Cloudflare Tunnel** | [$CF_URL]($CF_URL) |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🛡️ **SSH (Tailscale IP)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@$TS_IP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ **SSH (Headscale IP)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@$TS_IP\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🛡️ **SSH (MagicDNS)** | \`ssh -i ~/.ssh/id_ed25519_con itz_ytansh@${TARGET_NODE_NAME}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔑 **SSH Password (Fallback)** | \`itz_ytansh\` |" >> $GITHUB_STEP_SUMMARY
           echo "| ⏱️ **Lifetime** | ~5.5 Hours |" >> $GITHUB_STEP_SUMMARY
@@ -199,7 +205,7 @@ jobs:
           echo "✅ EPHEMERAL VPS IS READY (VIRGINIA CORE)!"
           echo "=============================================="
           echo "🌐 Cloudflare: $CF_URL"
-          echo "🛡️ SSH (Tailscale): ssh itz_ytansh@$TS_IP"
+          echo "🛡️ SSH (Headscale): ssh itz_ytansh@$TS_IP"
           echo "=============================================="
 
       - name: ⏳ Keep Session Alive
